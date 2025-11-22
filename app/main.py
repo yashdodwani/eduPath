@@ -2,6 +2,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.apis.routes import router as api_router
+from app.db.session import init_db
 
 # Initialize App
 app = FastAPI(
@@ -32,6 +33,13 @@ app.include_router(api_router, prefix="/api/v1", tags=["Roadmap Generation"])
 @app.get("/")
 def root():
     return {"message": "Agentic Learning System API is Online 🚀"}
+
+
+@app.on_event("startup")
+def on_startup():
+    # Initialize the DB (create tables if they don't exist)
+    init_db()
+
 
 if __name__ == "__main__":
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
