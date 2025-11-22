@@ -14,8 +14,13 @@ app = FastAPI(
 # CORS Configuration (Allow React Frontend)
 origins = [
     "http://localhost:3000",
-    "http://localhost:5173", # Vite default
-    "*" # For development only
+    "http://localhost:5173",
+
+    # Lovable preview URL
+    "https://id-preview--3a7b2998-fc47-4b75-9b46-fbfbfd416a18.lovable.app",
+
+    # If you have final deployed frontend, add here:
+    "https://your-frontend.lovable.app"
 ]
 
 app.add_middleware(
