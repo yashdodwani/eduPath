@@ -1,13 +1,25 @@
+import os
 import json
 import datetime
+from dotenv import load_dotenv
 import google.generativeai as genai
 from app.models.schemas import UserProfile, RoadmapResponse, AgentLog
 from app.utils.prompts import MARKET_ANALYST_PROMPT, ARCHITECT_PROMPT, CURATOR_PROMPT, CRITIC_PROMPT
 
-# Initialize Gemini (Use environment variable in production)
-# genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-# For this environment, the key is injected automatically or handled by the runtime.
+# Load environment variables from .env (if present)
+# This allows local development to place GEMINI_API_KEY in a .env file.
+load_dotenv()
 
+# Load Gemini API key from environment and configure the client
+API_KEY = os.getenv("GEMINI_API_KEY")
+if not API_KEY:
+    # Fail fast so callers know configuration is missing; in production you may want to
+    # log and continue or use a safer fallback.
+    raise RuntimeError("GEMINI_API_KEY is not set in the environment. Set it in your .env or environment variables.")
+
+genai.configure(api_key=API_KEY)
+
+# Instantiate the model after configuration
 model = genai.GenerativeModel("gemini-2.5-flash")
 
 
