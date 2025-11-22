@@ -1,0 +1,37 @@
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.apis.routes import router as api_router
+
+# Initialize App
+app = FastAPI(
+    title="Agentic Learning Path Generator",
+    description="Backend for AI-driven personalized education using Gemini 2.5 Flash.",
+    version="1.0.0"
+)
+
+# CORS Configuration (Allow React Frontend)
+origins = [
+    "http://localhost:3000",
+    "http://localhost:5173", # Vite default
+    "*" # For development only
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include Routers
+app.include_router(api_router, prefix="/api/v1", tags=["Roadmap Generation"])
+
+# Root endpoint
+@app.get("/")
+def root():
+    return {"message": "Agentic Learning System API is Online 🚀"}
+
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
