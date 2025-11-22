@@ -3,23 +3,23 @@ import json
 import datetime
 import re
 from dotenv import load_dotenv
-import google.generativeai as genai
+# google.generativeai imported lazily inside _ensure_model to avoid hard failure at import time
 from typing import Optional, List
 from app.models.schemas import UserProfile, RoadmapResponse, AgentLog as AgentLogSchema
 from app.utils.prompts import MARKET_ANALYST_PROMPT, ARCHITECT_PROMPT, CURATOR_PROMPT, CRITIC_PROMPT
+import logging
 
 load_dotenv()
+logger = logging.getLogger("uvicorn.error")
 
+# Read API key from env but don't crash at import if missing; we'll validate at call time
 API_KEY = os.getenv("GEMINI_API_KEY")
 if API_KEY:
-    # trim whitespace and surrounding quotes if present
     API_KEY = API_KEY.strip().strip('"').strip("'")
 
-if not API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not set in the environment. Set it in your .env or environment variables.")
-
-genai.configure(api_key=API_KEY)
-model = genai.GenerativeModel("gemini-2.5-flash")
+# Lazy container for the configured model client
+_genai = None
+_genai_model = None
 
 # Add DB imports lazily to avoid import cycles during test runs
 try:
@@ -29,25 +29,61 @@ except Exception:
     db_models = None
     Session = None
 
+
 class AgentWorkflow:
     def __init__(self, db_session: Optional[Session] = None):
         self.logs = []
         self.db = db_session
         self._current_roadmap_id: Optional[int] = None
 
+    def _ensure_model(self):
+        """Lazily import and configure the google.generativeai client and model.
+        Raises RuntimeError if GEMINI_API_KEY is missing or client init fails.
+        """
+        global _genai, _genai_model, API_KEY
+        if _genai_model is not None:
+            return
+        if not API_KEY:
+            # try to re-load from env in case runtime env was set after import
+            API_KEY = os.getenv("GEMINI_API_KEY")
+            if API_KEY:
+                API_KEY = API_KEY.strip().strip('"').strip("'")
+        if not API_KEY:
+            logger.warning("GEMINI_API_KEY missing at model initialization time")
+            raise RuntimeError("Gemini API key is not configured. Set GEMINI_API_KEY in your environment or .env before calling generation endpoints.")
+        try:
+            # Masked logging to show the key appears present without exposing it
+            masked = (API_KEY[:4] + "...." + API_KEY[-4:]) if len(API_KEY) > 8 else "****"
+            logger.info(f"Initializing Gemini client with key (masked): {masked}")
+
+            import google.generativeai as genai
+            _genai = genai
+            _genai.configure(api_key=API_KEY)
+            _genai_model = _genai.GenerativeModel("gemini-2.5-flash")
+            logger.info("Gemini client initialized successfully")
+        except Exception as e:
+            logger.exception("Failed to initialize Gemini client")
+            raise RuntimeError(f"Failed to initialize Gemini client: {e}")
+
     def _call_model(self, prompt: str):
         """Centralized Gemini call wrapper. Returns the raw response object.
         Raises RuntimeError with a clear message when the API request fails (e.g. invalid API key).
         """
+        # Ensure model is ready (this will raise a helpful error if API key is missing)
         try:
-            resp = model.generate_content(prompt)
+            self._ensure_model()
+        except RuntimeError:
+            # re-raise to preserve user-friendly message
+            raise
+        try:
+            # _genai_model should now be available
+            resp = _genai_model.generate_content(prompt)
             return resp
         except Exception as e:
-            # Avoid returning raw exception objects to clients; raise a RuntimeError with a concise message
             msg = str(e)
-            # Provide a helpful hint if it looks like an auth problem
+            logger.exception("Gemini API call failed")
             if "API key" in msg or "API_KEY" in msg or "invalid" in msg.lower():
-                raise RuntimeError("Gemini API error: invalid or missing GEMINI_API_KEY. Rotate the key and set GEMINI_API_KEY in your .env")
+                raise RuntimeError("Gemini API error: invalid or missing GEMINI_API_KEY. Rotate the key and set GEMINI_API_KEY in your .env or environment variables.")
             raise RuntimeError(f"Gemini API request failed: {msg}")
 
     def _log(self, agent: str, action: str):
@@ -68,10 +104,10 @@ class AgentWorkflow:
             progress_note = f"\n\nNOTE: The learner has completed modules with ids: {completed_module_ids}. When creating the updated path, skip or adapt content for those completed modules."
 
         # --- STEP 1: MARKET ANALYST AGENT ---
-        self._log("Market Analyst", f"Scanning job boards for '{profile.target_role}'...")
+        self._log("Market Analyst", f"Scanning job boards for '{profile.target_role}'..." )
         market_response = self._call_model(MARKET_ANALYST_PROMPT.format(target_role=profile.target_role))
         # Clean generic markdown json blocks or extract JSON from free text
-        market_data = self._clean_json(market_response.text)
+        market_data = self._clean_json(getattr(market_response, 'text', str(market_response)))
         self._log("Market Analyst", f"Identified {len(market_data)} critical skills.")
 
         # --- STEP 2: ARCHITECT AGENT ---
@@ -82,7 +118,7 @@ class AgentWorkflow:
             market_trends=json.dumps(market_data)
         ) + progress_note
         architect_response = self._call_model(architect_prompt)
-        structure_data = self._clean_json(architect_response.text)
+        structure_data = self._clean_json(getattr(architect_response, 'text', str(architect_response)))
         self._log("Architect", f"Created {len(structure_data)} modules.")
 
         # --- STEP 3: CURATOR AGENT ---
@@ -93,13 +129,13 @@ class AgentWorkflow:
         )
         curator_prompt = curator_prompt + progress_note
         curator_response = self._call_model(curator_prompt)
-        curated_data = self._clean_json(curator_response.text)
+        curated_data = self._clean_json(getattr(curator_response, 'text', str(curator_response)))
 
         # --- STEP 4: CRITIC AGENT ---
         self._log("Critic", "Validating logical flow and prerequisites...")
         critic_prompt = CRITIC_PROMPT.format(curated_path=json.dumps(curated_data)) + progress_note
         critic_response = self._call_model(critic_prompt)
-        final_roadmap = self._clean_json(critic_response.text)
+        final_roadmap = self._clean_json(getattr(critic_response, 'text', str(critic_response)))
         self._log("System", "Roadmap generation complete.")
 
         # Normalize the final roadmap to match Pydantic schemas
@@ -361,6 +397,5 @@ class AgentWorkflow:
                 except json.JSONDecodeError:
                     pass
             # Give up
-            print(f"Failed to parse JSON: {candidate[:300]}" )
+            print(f"Failed to parse JSON: {candidate[:300]}")
             return []
-

@@ -6,6 +6,7 @@ from app.db.session import get_session
 from app.db import models as db_models
 import datetime
 import json
+import os
 
 router = APIRouter()
 
@@ -122,3 +123,29 @@ def regenerate_roadmap(conversation_id: int, db: Session = Depends(get_session))
 @router.get("/health")
 def health_check():
     return {"status": "active", "service": "Agentic Learning Backend"}
+
+# Debug endpoint to verify Gemini client initialization (enabled via env var)
+@router.get("/debug/gen-init")
+def debug_genie_init():
+    """Attempt to lazily initialize the Gemini client and return a masked status.
+    Enabled only if ENABLE_GENIE_DEBUG env var is set to '1'|'true'|'yes'.
+    """
+    enabled = os.getenv("ENABLE_GENIE_DEBUG", "false").lower() in ("1", "true", "yes")
+    if not enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    try:
+        # Create a workflow instance and call the internal initializer
+        wf = AgentWorkflow()
+        # call protected internal method to trigger lazy init
+        try:
+            wf._ensure_model()
+            # If we reach here, the client initialized
+            gem_key = os.getenv("GEMINI_API_KEY")
+            masked = (gem_key[:4] + "...." + gem_key[-4:]) if gem_key and len(gem_key) > 8 else ("****" if gem_key else None)
+            return {"status": "initialized", "masked_key": masked}
+        except Exception as e:
+            # Return the error message but avoid leaking the key
+            return {"status": "error", "message": str(e)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -3,6 +3,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.apis.routes import router as api_router
 from app.db.session import init_db
+import os
+from dotenv import load_dotenv
+import logging
+
+# Load .env for local development so ALLOWED_ORIGINS and other env vars are available
+load_dotenv()
 
 # Initialize App
 app = FastAPI(
@@ -11,17 +17,41 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS Configuration (Allow React Frontend)
-origins = [
+logger = logging.getLogger("uvicorn.error")
+
+# Default CORS origins (keeps previous values)
+_default_origins = [
     "http://localhost:3000",
     "http://localhost:5173",
 
     # Lovable preview URL
     "https://id-preview--3a7b2998-fc47-4b75-9b46-fbfbfd416a18.lovable.app",
 
+    # Common deployed/lovable frontend used in preview/testing
+    "https://agent-path-forge.lovable.app",
+
     # If you have final deployed frontend, add here:
-    "https://your-frontend.lovable.app"
+    "https://your-frontend.lovable.app",
 ]
+
+# Allow configuring additional origins via environment variable ALLOWED_ORIGINS
+# Format: comma-separated list of origins. Use '*' to allow all origins (not recommended for production).
+_allowed_env = os.getenv("ALLOWED_ORIGINS", "")
+_allow_all = os.getenv("ALLOW_ALL_ORIGINS", "false").lower() in ("1", "true", "yes")
+
+if _allow_all:
+    origins = ["*"]
+else:
+    if _allowed_env:
+        # If '*' is provided explicitly, allow all origins
+        if _allowed_env.strip() == '*':
+            origins = ["*"]
+        else:
+            env_list = [o.strip() for o in _allowed_env.split(',') if o.strip()]
+            # Merge while preserving defaults first, then unique additions from env
+            origins = _default_origins + [o for o in env_list if o not in _default_origins]
+    else:
+        origins = _default_origins
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,6 +74,23 @@ def root():
 def on_startup():
     # Initialize the DB (create tables if they don't exist)
     init_db()
+    # Log resolved CORS origins for debugging in deployed logs
+    try:
+        logger.info(f"CORS origins: {origins}")
+    except Exception:
+        pass
+
+    # Log whether GEMINI_API_KEY is present in environment (masked) so you can confirm Render provided it
+    try:
+        gem_key = os.getenv("GEMINI_API_KEY")
+        if gem_key:
+            # mask the key for safe logging
+            masked = (gem_key[:4] + "...." + gem_key[-4:]) if len(gem_key) > 8 else "****"
+            logger.info(f"GEMINI_API_KEY present (masked): {masked}")
+        else:
+            logger.warning("GEMINI_API_KEY is NOT present in environment at startup.")
+    except Exception:
+        logger.exception("Error reading GEMINI_API_KEY from environment")
 
 
 if __name__ == "__main__":
