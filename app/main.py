@@ -23,7 +23,7 @@ logger = logging.getLogger("uvicorn.error")
 _default_origins = [
     "http://localhost:3000",
     "http://localhost:5173",
-    "http://localhost:8082"
+    "http://localhost:8082",
     # Lovable preview URL
     "https://id-preview--3a7b2998-fc47-4b75-9b46-fbfbfd416a18.lovable.app",
 
@@ -52,6 +52,16 @@ else:
             origins = _default_origins + [o for o in env_list if o not in _default_origins]
     else:
         origins = _default_origins
+
+# Safety: if origins somehow ends up empty, fallback to '*' and log — this prevents missing CORS headers.
+try:
+    if not origins:
+        logger.warning("Resolved CORS origins list is empty; falling back to allow all origins '*'.")
+        origins = ["*"]
+except Exception:
+    # If logger isn't configured yet, just ensure origins is non-empty
+    if not origins:
+        origins = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
