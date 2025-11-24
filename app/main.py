@@ -23,7 +23,7 @@ logger = logging.getLogger("uvicorn.error")
 _default_origins = [
     "http://localhost:3000",
     "http://localhost:5173",
-
+    "http://localhost:8082"
     # Lovable preview URL
     "https://id-preview--3a7b2998-fc47-4b75-9b46-fbfbfd416a18.lovable.app",
 
