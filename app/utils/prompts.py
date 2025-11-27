@@ -26,20 +26,40 @@ Instructions:
 Format: Return JSON. List of modules. Each module must have: 'module_name', 'description', 'skills_covered' (list), 'why_needed', 'estimated_time'.
 """
 
-# --- AGENT 3: CURATOR ---
+# --- AGENT 3: CURATOR (OPTIMIZED) ---
 CURATOR_PROMPT = """
 Act as a Senior Content Curator.
-Task: Find the best learning resources for specific modules.
-User Preference: {preferred_style} (Feature D).
+Task: Structure resource requirements for specific modules.
+User Preference: {preferred_style}.
 Input Modules: {modules}
 
 Instructions:
-1. For each module, suggest 2-3 high-quality, free resources (URLs).
-2. Adaptation: If user prefers '{preferred_style}', prioritize that format (e.g., YouTube for Video, MDN/Dev.to for Text).
-3. Vetting: Ensure resources are up-to-date (2024-2025).
+1. For each module, determine the optimal MIX of resource types based on user preference:
+   - If preference is 'Video': Suggest 3 video resources
+   - If preference is 'Text': Suggest 2-3 article/documentation resources  
+   - If preference is 'Interactive': Suggest 2-3 interactive courses/tutorials
 
-Format: Return the SAME JSON list of modules, but inject a 'resources' list into each module. 
-Each resource has: 'title', 'url' (dummy valid looking links), 'type', 'duration', 'reason'.
+2. For VIDEO resources: 
+   - DO NOT generate URLs - the system will fetch real YouTube videos automatically
+   - Just specify: {{"type": "Video", "title": "Suggested topic", "duration": "estimate", "reason": "why this topic"}}
+
+3. For NON-VIDEO resources (Articles, Documentation, Courses):
+   - Provide real, working URLs to high-quality free resources
+   - Prefer: MDN, freeCodeCamp, official documentation, Dev.to, Real Python
+   - Example URLs: "https://developer.mozilla.org/...", "https://docs.python.org/..."
+
+4. Resource Quality Guidelines:
+   - Prioritize official docs and well-known educational platforms
+   - Ensure resources are FREE and accessible
+   - Prefer resources from 2024-2025 when possible
+   - Include diverse perspectives (different teaching styles)
+
+Format: Return the SAME JSON list of modules, but ADD a 'resources' list to each module. 
+Each resource has: 'title', 'url' (use "AUTO_YOUTUBE" for videos), 'type', 'duration', 'reason'.
+
+Example resource objects:
+- Video: {{"title": "Advanced PostgreSQL Indexing", "url": "AUTO_YOUTUBE", "type": "Video", "duration": "~30min", "reason": "Covers indexing strategies"}}
+- Article: {{"title": "PostgreSQL Performance Tuning Guide", "url": "https://www.postgresql.org/docs/current/performance-tips.html", "type": "Article", "duration": "15min read", "reason": "Official docs on optimization"}}
 """
 
 # --- AGENT 4: CRITIC ---
@@ -51,7 +71,8 @@ Input Path: {curated_path}
 Instructions:
 1. Check for Logic Jumps: Is the jump from Module 1 to 2 too harsh?
 2. Check Prereqs: Do they learn 'React' before 'JavaScript'?
-3. Refinement: If issues found, fix the order or description. If good, return as is.
+3. Check Resource Quality: Are there enough diverse resources per module?
+4. Refinement: If issues found, fix the order or description. If good, return as is.
 
-Format: Return the final validated JSON.
+Format: Return the final validated JSON with the same structure as input.
 """

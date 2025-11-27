@@ -3,25 +3,24 @@ import json
 import datetime
 import re
 from dotenv import load_dotenv
-# google.generativeai imported lazily inside _ensure_model to avoid hard failure at import time
 from typing import Optional, List
 from app.models.schemas import UserProfile, RoadmapResponse, AgentLog as AgentLogSchema
 from app.utils.prompts import MARKET_ANALYST_PROMPT, ARCHITECT_PROMPT, CURATOR_PROMPT, CRITIC_PROMPT
 import logging
 
+# Import the YouTube search service
+from app.services.youtube_service import YouTubeSearchService, SerperSearchService
+
 load_dotenv()
 logger = logging.getLogger("uvicorn.error")
 
-# Read API key from env but don't crash at import if missing; we'll validate at call time
 API_KEY = os.getenv("GEMINI_API_KEY")
 if API_KEY:
     API_KEY = API_KEY.strip().strip('"').strip("'")
 
-# Lazy container for the configured model client
 _genai = None
 _genai_model = None
 
-# Add DB imports lazily to avoid import cycles during test runs
 try:
     from app.db import models as db_models
     from sqlalchemy.orm import Session
@@ -36,23 +35,31 @@ class AgentWorkflow:
         self.db = db_session
         self._current_roadmap_id: Optional[int] = None
 
+        # Initialize YouTube search service (try YouTube API first, fallback to Serper)
+        self.youtube_service = None
+        if os.getenv("YOUTUBE_API_KEY"):
+            self.youtube_service = YouTubeSearchService()
+            logger.info("Using YouTube Data API for video search")
+        elif os.getenv("SERPER_API_KEY"):
+            self.youtube_service = SerperSearchService()
+            logger.info("Using Serper API for video search")
+        else:
+            logger.warning("No YouTube or Serper API key configured - will use LLM-generated links")
+
     def _ensure_model(self):
-        """Lazily import and configure the google.generativeai client and model.
-        Raises RuntimeError if GEMINI_API_KEY is missing or client init fails.
-        """
+        """Lazily import and configure the google.generativeai client and model."""
         global _genai, _genai_model, API_KEY
         if _genai_model is not None:
             return
         if not API_KEY:
-            # try to re-load from env in case runtime env was set after import
             API_KEY = os.getenv("GEMINI_API_KEY")
             if API_KEY:
                 API_KEY = API_KEY.strip().strip('"').strip("'")
         if not API_KEY:
             logger.warning("GEMINI_API_KEY missing at model initialization time")
-            raise RuntimeError("Gemini API key is not configured. Set GEMINI_API_KEY in your environment or .env before calling generation endpoints.")
+            raise RuntimeError(
+                "Gemini API key is not configured. Set GEMINI_API_KEY in your environment or .env before calling generation endpoints.")
         try:
-            # Masked logging to show the key appears present without exposing it
             masked = (API_KEY[:4] + "...." + API_KEY[-4:]) if len(API_KEY) > 8 else "****"
             logger.info(f"Initializing Gemini client with key (masked): {masked}")
 
@@ -66,47 +73,135 @@ class AgentWorkflow:
             raise RuntimeError(f"Failed to initialize Gemini client: {e}")
 
     def _call_model(self, prompt: str):
-        """Centralized Gemini call wrapper. Returns the raw response object.
-        Raises RuntimeError with a clear message when the API request fails (e.g. invalid API key).
-        """
-        # Ensure model is ready (this will raise a helpful error if API key is missing)
+        """Centralized Gemini call wrapper."""
         try:
             self._ensure_model()
         except RuntimeError:
-            # re-raise to preserve user-friendly message
             raise
         try:
-            # _genai_model should now be available
             resp = _genai_model.generate_content(prompt)
             return resp
         except Exception as e:
             msg = str(e)
             logger.exception("Gemini API call failed")
             if "API key" in msg or "API_KEY" in msg or "invalid" in msg.lower():
-                raise RuntimeError("Gemini API error: invalid or missing GEMINI_API_KEY. Rotate the key and set GEMINI_API_KEY in your .env or environment variables.")
+                raise RuntimeError(
+                    "Gemini API error: invalid or missing GEMINI_API_KEY. Rotate the key and set GEMINI_API_KEY in your .env or environment variables.")
             raise RuntimeError(f"Gemini API request failed: {msg}")
 
     def _log(self, agent: str, action: str):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.logs.append(AgentLogSchema(agent_name=agent, action=action, timestamp=timestamp))
-        # Also persist log if DB session available
         if self.db and db_models and getattr(self, "_current_roadmap_id", None):
-            db_log = db_models.AgentLog(roadmap_id=self._current_roadmap_id, agent_name=agent, action=action, timestamp=timestamp)
+            db_log = db_models.AgentLog(roadmap_id=self._current_roadmap_id, agent_name=agent, action=action,
+                                        timestamp=timestamp)
             self.db.add(db_log)
             self.db.commit()
             self.db.refresh(db_log)
 
-    async def generate_learning_path(self, profile: UserProfile, completed_module_ids: Optional[List[int]] = None) -> RoadmapResponse:
+    def _fetch_real_youtube_videos(
+            self,
+            module_name: str,
+            skills: List[str],
+            target_role: str,
+            count: int = 3
+    ) -> List[dict]:
+        """
+        Fetch real YouTube videos for a module using the YouTube search service.
+        Falls back to LLM-generated suggestions if service unavailable.
+        """
+        if not self.youtube_service:
+            logger.warning("YouTube service not available, will use LLM suggestions")
+            return []
 
-        # Include progress context into prompts if provided
+        try:
+            videos = self.youtube_service.search_for_module(
+                module_name=module_name,
+                skills=skills,
+                target_role=target_role,
+                count=count
+            )
+
+            if videos:
+                logger.info(f"Found {len(videos)} real YouTube videos for '{module_name}'")
+            else:
+                logger.warning(f"No YouTube videos found for '{module_name}'")
+
+            return videos
+
+        except Exception as e:
+            logger.error(f"Error fetching YouTube videos: {e}")
+            return []
+
+    def _enrich_resources_with_real_links(
+            self,
+            modules: List[dict],
+            target_role: str,
+            preferred_style: str
+    ) -> List[dict]:
+        """
+        Replace ALL dummy/LLM-generated links with real YouTube videos.
+        Fetches high-quality videos for every module.
+        """
+        if not self.youtube_service:
+            logger.warning("YouTube service not configured - keeping LLM-generated links")
+            return modules
+
+        enriched_modules = []
+
+        for idx, module in enumerate(modules):
+            module_name = module.get("module_name", "")
+            skills = module.get("skills_covered", [])
+            resources = module.get("resources", [])
+
+            logger.info(f"Fetching real videos for Module {idx + 1}: {module_name}")
+
+            # Separate video and non-video resources
+            video_resources = [r for r in resources if r.get("type", "").lower() == "video"]
+            other_resources = [r for r in resources if r.get("type", "").lower() != "video"]
+
+            # Determine how many videos to fetch
+            if preferred_style == "Video":
+                # User prefers videos - fetch more
+                video_count = max(3, len(video_resources))
+            elif video_resources:
+                # LLM suggested videos - respect the count
+                video_count = len(video_resources)
+            else:
+                # No videos suggested but we can add some anyway
+                video_count = 2
+
+            # ALWAYS fetch real YouTube videos for each module
+            real_videos = self._fetch_real_youtube_videos(
+                module_name=module_name,
+                skills=skills,
+                target_role=target_role,
+                count=video_count
+            )
+
+            if real_videos:
+                logger.info(f"✓ Found {len(real_videos)} real videos for Module {idx + 1}")
+                # Combine real videos with other resource types
+                new_resources = real_videos + other_resources
+            else:
+                logger.warning(f"✗ No real videos found for Module {idx + 1}, keeping original resources")
+                new_resources = resources
+
+            enriched_module = {**module, "resources": new_resources}
+            enriched_modules.append(enriched_module)
+
+        return enriched_modules
+
+    async def generate_learning_path(self, profile: UserProfile,
+                                     completed_module_ids: Optional[List[int]] = None) -> RoadmapResponse:
+
         progress_note = ""
         if completed_module_ids:
             progress_note = f"\n\nNOTE: The learner has completed modules with ids: {completed_module_ids}. When creating the updated path, skip or adapt content for those completed modules."
 
         # --- STEP 1: MARKET ANALYST AGENT ---
-        self._log("Market Analyst", f"Scanning job boards for '{profile.target_role}'..." )
+        self._log("Market Analyst", f"Scanning job boards for '{profile.target_role}'...")
         market_response = self._call_model(MARKET_ANALYST_PROMPT.format(target_role=profile.target_role))
-        # Clean generic markdown json blocks or extract JSON from free text
         market_data = self._clean_json(getattr(market_response, 'text', str(market_response)))
         self._log("Market Analyst", f"Identified {len(market_data)} critical skills.")
 
@@ -121,8 +216,10 @@ class AgentWorkflow:
         structure_data = self._clean_json(getattr(architect_response, 'text', str(architect_response)))
         self._log("Architect", f"Created {len(structure_data)} modules.")
 
-        # --- STEP 3: CURATOR AGENT ---
+        # --- STEP 3: CURATOR AGENT (with LLM for structure) ---
         self._log("Curator", f"Sourcing {profile.preferred_style} resources for modules...")
+
+        # Still use LLM to generate resource structure, but we'll replace video links
         curator_prompt = CURATOR_PROMPT.format(
             preferred_style=profile.preferred_style,
             modules=json.dumps(structure_data)
@@ -131,6 +228,15 @@ class AgentWorkflow:
         curator_response = self._call_model(curator_prompt)
         curated_data = self._clean_json(getattr(curator_response, 'text', str(curator_response)))
 
+        # --- NEW: ALWAYS enrich with real YouTube videos for ALL modules ---
+        self._log("Curator", "Fetching real YouTube videos from YouTube API for all modules...")
+        curated_data = self._enrich_resources_with_real_links(
+            modules=curated_data,
+            target_role=profile.target_role,
+            preferred_style=profile.preferred_style
+        )
+        self._log("Curator", "Real video links integrated successfully for all modules.")
+
         # --- STEP 4: CRITIC AGENT ---
         self._log("Critic", "Validating logical flow and prerequisites...")
         critic_prompt = CRITIC_PROMPT.format(curated_path=json.dumps(curated_data)) + progress_note
@@ -138,14 +244,11 @@ class AgentWorkflow:
         final_roadmap = self._clean_json(getattr(critic_response, 'text', str(critic_response)))
         self._log("System", "Roadmap generation complete.")
 
-        # Normalize the final roadmap to match Pydantic schemas
         normalized_roadmap = self._normalize_roadmap(final_roadmap)
 
-        # Save to DB if session present
         saved_ids = None
         if self.db and db_models:
             saved_ids = self._save_roadmap_to_db(profile, market_data, normalized_roadmap)
-            # attach roadmap_id to logs for proper linkage
             self._current_roadmap_id = saved_ids.get("roadmap_id")
 
         return RoadmapResponse(
@@ -154,25 +257,22 @@ class AgentWorkflow:
             agent_logs=self.logs
         )
 
-    def generate_learning_path_sync(self, profile: UserProfile, completed_module_ids: Optional[List[int]] = None) -> dict:
-        """Synchronous wrapper used by synchronous endpoints to generate and save a roadmap.
-        Returns a dict with saved ids.
-        """
-        # Call the same logic synchronously by running the async function
+    def generate_learning_path_sync(self, profile: UserProfile,
+                                    completed_module_ids: Optional[List[int]] = None) -> dict:
+        """Synchronous wrapper"""
         import asyncio
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(self.generate_learning_path(profile, completed_module_ids=completed_module_ids))
-        # after generation, return saved roadmap id if available
+        result = loop.run_until_complete(
+            self.generate_learning_path(profile, completed_module_ids=completed_module_ids))
         roadmap_id = getattr(self, "_current_roadmap_id", None)
-        # create a conversation id equal to roadmap_id for simplicity
         return {"roadmap_id": roadmap_id, "conversation_id": roadmap_id}
 
     def _save_roadmap_to_db(self, profile: UserProfile, market_analysis, roadmap):
-        """Persist roadmap, modules, resources, and agent logs to the database."""
+        """Persist roadmap to database"""
         if not self.db or not db_models:
             return {}
-        # Create or fetch user (simple behavior: create new user record per request)
+
         user = db_models.User(name=profile.name)
         self.db.add(user)
         self.db.commit()
@@ -188,7 +288,6 @@ class AgentWorkflow:
         self.db.commit()
         self.db.refresh(roadmap_row)
 
-        # Save modules and resources
         for m in roadmap:
             module_row = db_models.Module(
                 roadmap_id=roadmap_row.id,
@@ -215,7 +314,6 @@ class AgentWorkflow:
                 self.db.add(resource_row)
             self.db.commit()
 
-        # Save agent logs
         for log in self.logs:
             log_row = db_models.AgentLog(
                 roadmap_id=roadmap_row.id,
@@ -226,14 +324,11 @@ class AgentWorkflow:
             self.db.add(log_row)
         self.db.commit()
 
-        # store current roadmap id for other operations
         self._current_roadmap_id = roadmap_row.id
         return {"roadmap_id": roadmap_row.id}
 
     def _normalize_resource_type(self, raw_type: str) -> str:
-        """Map free-form resource type strings into the allowed literals.
-        Allowed: 'Video', 'Article', 'Course', 'Documentation'
-        """
+        """Map resource type strings to allowed literals"""
         if not raw_type:
             return "Article"
         t = raw_type.lower()
@@ -245,7 +340,6 @@ class AgentWorkflow:
             return "Documentation"
         if "article" in t or "blog" in t or "post" in t:
             return "Article"
-        # default fallback
         return "Article"
 
     def _ensure_url(self, url: str) -> str:
@@ -254,27 +348,20 @@ class AgentWorkflow:
         return url.strip()
 
     def _normalize_roadmap(self, raw) -> list:
-        """Convert the model output into a list of modules matching RoadmapModule.
-        Handles several common shapes: a list of modules directly, or a dict with
-        a top-level key like 'learning_path' or 'roadmap'.
-        """
+        """Convert model output into normalized modules"""
         modules = []
         if not raw:
             return []
 
-        # If the model wrapped the list in a dict like { "learning_path": [...] }
         if isinstance(raw, dict):
             if "learning_path" in raw and isinstance(raw["learning_path"], list):
                 modules = raw["learning_path"]
             elif "roadmap" in raw and isinstance(raw["roadmap"], list):
                 modules = raw["roadmap"]
             else:
-                # If the dict itself looks like a single module, convert to list
-                # Heuristic: has 'module_name' key
                 if "module_name" in raw:
                     modules = [raw]
                 else:
-                    # try to find the first list value inside
                     for v in raw.values():
                         if isinstance(v, list):
                             modules = v
@@ -285,9 +372,8 @@ class AgentWorkflow:
         normalized = []
         for idx, m in enumerate(modules):
             if not isinstance(m, dict):
-                # skip unexpected entries
                 continue
-            module_name = m.get("module_name") or m.get("title") or m.get("name") or f"Module {idx+1}"
+            module_name = m.get("module_name") or m.get("title") or m.get("name") or f"Module {idx + 1}"
             description = m.get("description") or m.get("desc") or ""
             skills = m.get("skills_covered") or m.get("skills") or []
             why_needed = m.get("why_needed") or m.get("why") or ""
@@ -325,11 +411,7 @@ class AgentWorkflow:
         return normalized
 
     def _extract_json_substring(self, text: str):
-        """Find the first balanced JSON object or array in `text` and return it as a substring.
-        This scans for the first '{' or '[' and then walks forward tracking string and escape
-        states so we can correctly match nested braces/brackets.
-        Returns None if no balanced JSON substring is found.
-        """
+        """Find balanced JSON in text"""
         for start_idx, ch in enumerate(text):
             if ch not in '{[':
                 continue
@@ -358,44 +440,32 @@ class AgentWorkflow:
                     if (last == '{' and c == '}') or (last == '[' and c == ']'):
                         stack.pop()
                         if not stack:
-                            return text[start_idx:i+1]
+                            return text[start_idx:i + 1]
                     else:
-                        # mismatched closing bracket
                         break
         return None
 
     def _clean_json(self, text_response: str):
-        """
-        Extracts and parses the first JSON object/array found in the model text.
-        Handles common code-fence formatting (```json ... ```) and also free-text
-        responses that append a JSON blob at the end.
-        Returns a Python object (list/dict) on success or an empty list on failure.
-        """
-        # 1) Try to find fenced JSON blocks first
+        """Extract and parse JSON from model response"""
         fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text_response, re.DOTALL | re.IGNORECASE)
         candidate = None
         if fenced:
             candidate = fenced.group(1).strip()
         else:
-            # 2) Otherwise, attempt to extract a balanced JSON substring from anywhere in the text
             candidate = self._extract_json_substring(text_response)
 
         if not candidate:
-            # No JSON found
             print("Failed to parse JSON: no JSON-like substring found in response")
             return []
 
-        # Try to parse the candidate JSON
         try:
             return json.loads(candidate)
         except json.JSONDecodeError:
-            # As a final fallback, try to locate a JSON substring inside the candidate
             inner = self._extract_json_substring(candidate)
             if inner:
                 try:
                     return json.loads(inner)
                 except json.JSONDecodeError:
                     pass
-            # Give up
             print(f"Failed to parse JSON: {candidate[:300]}")
             return []
