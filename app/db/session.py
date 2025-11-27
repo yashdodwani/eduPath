@@ -23,13 +23,26 @@ DATABASE_URL = _clean_db_url(DATABASE_URL)
 _engine = None
 SessionLocal = None
 
+# ----------------------------------------------------
+# 💡 FIX START: Explicitly require SSL for Postgres
+# ----------------------------------------------------
+connect_args = {}
+
+# Accept either postgres:// or postgresql:// prefixes
+if DATABASE_URL and DATABASE_URL.startswith(("postgres://", "postgresql://")):
+    # Many hosted Postgres providers require SSL (for example Render, Heroku, etc.)
+    connect_args = {"sslmode": "require"}
+
 if DATABASE_URL:
     try:
-        _engine = create_engine(DATABASE_URL, echo=False)
+        _engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args)
         # Try a lightweight connection test (will raise on DNS/connect failures)
         with _engine.connect() as conn:
             pass
     except Exception as e:
+# ----------------------------------------------------
+# 💡 FIX END
+# ----------------------------------------------------
         # Remote DB is unreachable (DNS/network/credentials); fall back to local sqlite for dev
         print(f"Warning: could not connect to DATABASE_URL, falling back to local sqlite. Error: {e}")
         _engine = create_engine("sqlite:///./edu_path_local.db", echo=False)
